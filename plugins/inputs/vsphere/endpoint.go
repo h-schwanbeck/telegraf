@@ -37,6 +37,8 @@ const maxSampleConst = 10 // Absolute maximum number of samples regardless of pe
 
 const maxMetadataSamples = 100 // Number of resources to sample for metric metadata
 
+const maxRealtimeMetrics = 50000 // Absolute maximum metrics per realtime query
+
 const hwMarkTTL = time.Duration(4 * time.Hour)
 
 type queryChunk []types.PerfQuerySpec
@@ -308,7 +310,7 @@ func (e *Endpoint) init(ctx context.Context) error {
 	return nil
 }
 
-func (e *Endpoint) getMetricNameForId(id int32) string {
+func (e *Endpoint) getMetricNameForID(id int32) string {
 	e.metricNameMux.RLock()
 	defer e.metricNameMux.RUnlock()
 	return e.metricNameLookup[id]
@@ -322,13 +324,13 @@ func (e *Endpoint) reloadMetricNameMap(ctx context.Context) error {
 		return err
 	}
 
-	mn, err := client.CounterInfoByName(ctx)
+	mn, err := client.CounterInfoByKey(ctx)
 	if err != nil {
 		return err
 	}
 	e.metricNameLookup = make(map[int32]string)
-	for name, m := range mn {
-		e.metricNameLookup[m.Key] = name
+	for key, m := range mn {
+		e.metricNameLookup[key] = m.Name()
 	}
 	return nil
 }
@@ -348,7 +350,11 @@ func (e *Endpoint) getMetadata(ctx context.Context, obj *objectRef, sampling int
 	return metrics, nil
 }
 
-func (e *Endpoint) getDatacenterName(ctx context.Context, client *Client, cache map[string]string, r types.ManagedObjectReference) string {
+func (e *Endpoint) getDatacenterName(ctx context.Context, client *Client, cache map[string]string, r types.ManagedObjectReference) (string, bool) {
+	return e.getAncestorName(ctx, client, "Datacenter", cache, r)
+}
+
+func (e *Endpoint) getAncestorName(ctx context.Context, client *Client, resourceType string, cache map[string]string, r types.ManagedObjectReference) (string, bool) {
 	path := make([]string, 0)
 	returnVal := ""
 	here := r
@@ -370,7 +376,7 @@ func (e *Endpoint) getDatacenterName(ctx context.Context, client *Client, cache 
 				e.Parent.Log.Warnf("Error while resolving parent. Assuming no parent exists. Error: %s", err.Error())
 				return true
 			}
-			if result.Reference().Type == "Datacenter" {
+			if result.Reference().Type == resourceType {
 				// Populate cache for the entire chain of objects leading here.
 				returnVal = result.Name
 				return true
@@ -386,7 +392,7 @@ func (e *Endpoint) getDatacenterName(ctx context.Context, client *Client, cache 
 	for _, s := range path {
 		cache[s] = returnVal
 	}
-	return returnVal
+	return returnVal, returnVal != ""
 }
 
 func (e *Endpoint) discover(ctx context.Context) error {
@@ -433,10 +439,10 @@ func (e *Endpoint) discover(ctx context.Context) error {
 			}
 
 			// Fill in datacenter names where available (no need to do it for Datacenters)
-			if res.name != "Datacenter" {
+			if res.name != "datacenter" {
 				for k, obj := range objects {
 					if obj.parentRef != nil {
-						obj.dcname = e.getDatacenterName(ctx, client, dcNameCache, *obj.parentRef)
+						obj.dcname, _ = e.getDatacenterName(ctx, client, dcNameCache, *obj.parentRef)
 						objects[k] = obj
 					}
 				}
@@ -449,11 +455,11 @@ func (e *Endpoint) discover(ctx context.Context) error {
 				} else {
 					e.complexMetadataSelect(ctx, res, objects)
 				}
-				newObjects[k] = objects
-
-				SendInternalCounterWithTags("discovered_objects", e.URL.Host, map[string]string{"type": res.name}, int64(len(objects)))
-				numRes += int64(len(objects))
 			}
+			newObjects[k] = objects
+
+			SendInternalCounterWithTags("discovered_objects", e.URL.Host, map[string]string{"type": res.name}, int64(len(objects)))
+			numRes += int64(len(objects))
 		}
 		if err != nil {
 			e.log.Error(err)
@@ -464,8 +470,8 @@ func (e *Endpoint) discover(ctx context.Context) error {
 	dss := newObjects["datastore"]
 	l2d := make(map[string]string)
 	for _, ds := range dss {
-		lunId := ds.altID
-		m := isolateLUN.FindStringSubmatch(lunId)
+		lunID := ds.altID
+		m := isolateLUN.FindStringSubmatch(lunID)
 		if m != nil {
 			l2d[m[1]] = ds.name
 		}
@@ -561,7 +567,7 @@ func (e *Endpoint) complexMetadataSelect(ctx context.Context, res *resourceKind,
 					} else {
 						m.Instance = ""
 					}
-					if res.filters.Match(e.getMetricNameForId(m.CounterId)) {
+					if res.filters.Match(e.getMetricNameForID(m.CounterId)) {
 						mMap[strconv.Itoa(int(m.CounterId))+"|"+m.Instance] = m
 					}
 				}
@@ -639,6 +645,12 @@ func getClusters(ctx context.Context, e *Endpoint, filter *ResourceFilter) (obje
 					cache[r.Parent.Value] = p
 				}
 			}
+			m[r.ExtensibleManagedObject.Reference().Value] = &objectRef{
+				name:         r.Name,
+				ref:          r.ExtensibleManagedObject.Reference(),
+				parentRef:    p,
+				customValues: e.loadCustomAttributes(&r.ManagedEntity),
+			}
 			return nil
 		}()
 		if err != nil {
@@ -700,7 +712,7 @@ func getVMs(ctx context.Context, e *Endpoint, filter *ResourceFilter) (objectMap
 			ips := make(map[string][]string)
 			for _, ip := range net.IpConfig.IpAddress {
 				addr := ip.IpAddress
-				for _, ipType := range e.Parent.IpAddresses {
+				for _, ipType := range e.Parent.IPAddresses {
 					if !(ipType == "ipv4" && isIPv4.MatchString(addr) ||
 						ipType == "ipv6" && isIPv6.MatchString(addr)) {
 						continue
@@ -767,18 +779,18 @@ func getDatastores(ctx context.Context, e *Endpoint, filter *ResourceFilter) (ob
 	}
 	m := make(objectMap)
 	for _, r := range resources {
-		lunId := ""
+		lunID := ""
 		if r.Info != nil {
 			info := r.Info.GetDatastoreInfo()
 			if info != nil {
-				lunId = info.Url
+				lunID = info.Url
 			}
 		}
 		m[r.ExtensibleManagedObject.Reference().Value] = &objectRef{
 			name:         r.Name,
 			ref:          r.ExtensibleManagedObject.Reference(),
 			parentRef:    r.Parent,
-			altID:        lunId,
+			altID:        lunID,
 			customValues: e.loadCustomAttributes(&r.ManagedEntity),
 		}
 	}
@@ -879,15 +891,16 @@ func (e *Endpoint) chunkify(ctx context.Context, res *resourceKind, now time.Tim
 	}
 
 	pqs := make(queryChunk, 0, e.Parent.MaxQueryObjects)
+	numQs := 0
 
 	for _, object := range res.objects {
 		timeBuckets := make(map[int64]*types.PerfQuerySpec, 0)
 		for metricIdx, metric := range res.metrics {
 
 			// Determine time of last successful collection
-			metricName := e.getMetricNameForId(metric.CounterId)
+			metricName := e.getMetricNameForID(metric.CounterId)
 			if metricName == "" {
-				e.log.Info("Unable to find metric name for id %d. Skipping!", metric.CounterId)
+				e.log.Infof("Unable to find metric name for id %d. Skipping!", metric.CounterId)
 				continue
 			}
 			start, ok := e.hwMarks.Get(object.ref.Value, metricName)
@@ -914,9 +927,9 @@ func (e *Endpoint) chunkify(ctx context.Context, res *resourceKind, now time.Tim
 			// Add this metric to the bucket
 			bucket.MetricId = append(bucket.MetricId, metric)
 
-			// Bucket filled to capacity? (Only applies to non real time)
+			// Bucket filled to capacity?
 			// OR if we're past the absolute maximum limit
-			if (!res.realTime && len(bucket.MetricId) >= maxMetrics) || len(bucket.MetricId) > 100000 {
+			if (!res.realTime && len(bucket.MetricId) >= maxMetrics) || len(bucket.MetricId) > maxRealtimeMetrics {
 				e.log.Debugf("Submitting partial query: %d metrics (%d remaining) of type %s for %s. Total objects %d",
 					len(bucket.MetricId), len(res.metrics)-metricIdx, res.name, e.URL.Host, len(res.objects))
 
@@ -933,16 +946,18 @@ func (e *Endpoint) chunkify(ctx context.Context, res *resourceKind, now time.Tim
 		// Handle data in time bucket and submit job if we've reached the maximum number of object.
 		for _, bucket := range timeBuckets {
 			pqs = append(pqs, *bucket)
-			if (!res.realTime && len(pqs) > e.Parent.MaxQueryObjects) || len(pqs) > 100000 {
-				e.log.Debugf("Submitting final bucket job for %s: %d metrics", res.name, len(bucket.MetricId))
+			numQs += len(bucket.MetricId)
+			if (!res.realTime && numQs > e.Parent.MaxQueryObjects) || numQs > maxRealtimeMetrics {
+				e.log.Debugf("Submitting final bucket job for %s: %d metrics", res.name, numQs)
 				submitChunkJob(ctx, te, job, pqs)
 				pqs = make(queryChunk, 0, e.Parent.MaxQueryObjects)
+				numQs = 0
 			}
 		}
 	}
 	// Submit any jobs left in the queue
 	if len(pqs) > 0 {
-		e.log.Debugf("Submitting job for %s: %d objects", res.name, len(pqs))
+		e.log.Debugf("Submitting job for %s: %d objects, %d metrics", res.name, len(pqs), numQs)
 		submitChunkJob(ctx, te, job, pqs)
 	}
 
